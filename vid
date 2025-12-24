@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# vid — Loom-UX: Screen recording -> Share-ready MP4
+# Naming contract:
+#   [inputname]_[caseFunction]_[quality]_[version].mp4
+# Examples:
+#   demo_share.mp4
+#   demo_share_v2.mp4
+#   demo_share_low.mp4
+#   demo_share_low_v8.mp4
+#   demo_share_high.mp4
+# ------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+vid — make a video share-ready (Loom-UX)
+
+Usage:
+  vid share <input> [output.mp4|output|output_dir/] [-q|--quality low|default|high] [-v|--verbose]
+  vid --help
+
+Behavior:
+  - Produces MP4 (faststart), H.264, yuv420p, CFR 30fps.
+  - Caps resolution to avoid Retina/HiDPI surprises (preset-dependent).
+  - Hides ffmpeg logs by default and shows a progress indicator.
+  - Use --verbose to show full ffmpeg output.
+  - Default output naming:
+      <name>_share.mp4 | <name>_share_low.mp4 | <name>_share_high.mp4
+  - Never overwrites: auto-increments _vN.
+  - If output is a directory (existing OR ends with '/'), file is placed inside it
+    using the default naming scheme.
+  - Missing output directories are created automatically.
+  - If output is a file path WITHOUT extension, ".mp4" is appended automatically.
+EOF
+}
+
+die() { echo "❌ $*" >&2; exit 1; }
+ok()  { echo "✅ $*"; }
+
+has_tool() { command -v "$1" >/dev/null 2>&1; }
+
+need_tools() {
+  has_tool ffmpeg  || die "ffmpeg not found (brew install ffmpeg)"
+  has_tool ffprobe || die "ffprobe not found (usually installed with ffmpeg)"
+  has_tool python3 || die "python3 not found (required)"
+}
+
+# macOS stat; fallback for GNU coreutils
+file_size_bytes() {
+  local f="$1"
+  if stat -f%z "$f" >/dev/null 2>&1; then
+    stat -f%z "$f"
+  else
+    stat -c%s "$f"
+  fi
+}
+
+bytes_to_mib() {
+  python3 - <<'PY' "$1"
+import sys
+b=float(sys.argv[1])
+print(f"{b/1024/1024:.2f}")
+PY
+}
+
+pct_change() {
+  python3 - <<'PY' "$1" "$2"
+import sys
+inp=float(sys.argv[1]); out=float(sys.argv[2])
+if inp <= 0:
+    print("0")
+else:
+    pct = ((out/inp) - 1) * 100
+    print(f"{pct:.0f}")
+PY
+}
+
+get_duration_seconds() {
+  ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$1" | head -n1
+}
+
+get_video_wh() {
+  ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$1" | head -n1
+}
+
+get_video_fps() {
+  python3 - <<'PY' "$1"
+import subprocess, sys
+v = subprocess.check_output([
+  "ffprobe","-v","error","-select_streams","v:0",
+  "-show_entries","stream=avg_frame_rate",
+  "-of","default=nk=1:nw=1", sys.argv[1]
+]).decode().strip().splitlines()
+v = v[0] if v else ""
+try:
+    if "/" in v:
+        num, den = v.split("/",1)
+        fps = float(num)/float(den)
+    else:
+        fps = float(v)
+    print(f"{fps:.0f}")
+except Exception:
+    print("")
+PY
+}
+
+get_audio_summary() {
+  python3 - <<'PY' "$1"
+import subprocess, sys, json
+try:
+    raw = subprocess.check_output([
+        "ffprobe","-v","error","-select_streams","a:0",
+        "-show_entries","stream=codec_name,channels",
+        "-of","json", sys.argv[1]
+    ]).decode()
+    j = json.loads(raw)
+except Exception:
+    print("(none)")
+    raise SystemExit
+
+streams = j.get("streams") or []
+if not streams:
+    print("(none)")
+else:
+    s = streams[0]
+    c = (s.get("codec_name") or "").upper() or "AUDIO"
+    ch = s.get("channels")
+    print(f"{c} {ch}ch" if ch is not None else c)
+PY
+}
+
+format_elapsed() {
+  python3 - <<'PY' "$1"
+import sys
+s=int(sys.argv[1])
+h=s//3600
+m=(s%3600)//60
+sec=s%60
+print(f"{h}:{m:02d}:{sec:02d}" if h>0 else f"{m}:{sec:02d}")
+PY
+}
+
+# -------------------------
+# Naming helpers
+# -------------------------
+
+strip_ext() {
+  local p="$1"
+  local base
+  base="$(basename "$p")"
+  echo "${base%.*}"
+}
+
+dirname_of() { dirname "$1"; }
+
+build_default_out() {
+  # Args: input_path case_fn quality
+  local in="$1" case_fn="$2" quality="$3"
+  local dir stem name
+  dir="$(dirname_of "$in")"
+  stem="$(strip_ext "$in")"
+
+  name="${stem}_${case_fn}"
+  if [[ "$quality" == "low" || "$quality" == "high" ]]; then
+    name="${name}_${quality}"
+  fi
+
+  echo "${dir}/${name}.mp4"
+}
+
+next_versioned_path() {
+  # Never overwrite. If exists:
+  # - if already ends with _vN -> bump N
+  # - else -> add _v2
+  local path="$1"
+  [[ ! -e "$path" ]] && { echo "$path"; return; }
+
+  local dir base ext stem
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    ext=".${base##*.}"
+    stem="${base%.*}"
+  else
+    ext=""
+    stem="$base"
+  fi
+
+  # If already has _vN — bump it
+  if [[ "$stem" =~ ^(.*)_v([0-9]+)$ ]]; then
+    local prefix="${BASH_REMATCH[1]}"
+    local n="${BASH_REMATCH[2]}"
+    local candidate
+
+    n=$((n+1))
+    candidate="${dir}/${prefix}_v${n}${ext}"
+    while [[ -e "$candidate" ]]; do
+      n=$((n+1))
+      candidate="${dir}/${prefix}_v${n}${ext}"
+    done
+    echo "$candidate"
+    return
+  fi
+
+  # Otherwise add _v2
+  local n=2
+  local candidate="${dir}/${stem}_v${n}${ext}"
+  while [[ -e "$candidate" ]]; do
+    n=$((n+1))
+    candidate="${dir}/${stem}_v${n}${ext}"
+  done
+  echo "$candidate"
+}
+
+is_probably_dir_arg() {
+  # Treat as dir if:
+  # - path exists and is a directory
+  # - OR ends with a slash
+  local p="$1"
+  [[ -d "$p" ]] && return 0
+  [[ "$p" == */ ]] && return 0
+  return 1
+}
+
+ensure_mp4_extension_if_file() {
+  # If the argument is NOT a directory and has NO extension, append ".mp4".
+  # We define "has extension" as having a dot in the basename that is not the first char.
+  local p="$1"
+  local b
+  b="$(basename "$p")"
+
+  # Keep as-is for directories (real or "dir/" style)
+  if is_probably_dir_arg "$p"; then
+    echo "$p"
+    return
+  fi
+
+  # If basename already has an extension like "x.mp4" or "x.mov" — keep
+  if [[ "$b" == *.* && "$b" != .* ]]; then
+    echo "$p"
+    return
+  fi
+
+  # Otherwise append .mp4
+  echo "${p}.mp4"
+}
+
+# -------------------------
+# Progress UI
+# -------------------------
+
+render_progress_line() {
+  local pct="$1"
+  local width="${2:-24}"
+
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+
+  local bar="" i
+  for ((i=0; i<filled; i++)); do bar+="#"; done
+  for ((i=0; i<empty;  i++)); do bar+="-"; done
+
+  printf "\r\033[2K[%s] %3d%%" "$bar" "$pct"
+}
+
+clear_progress_line() { printf "\r\033[2K"; }
+
+run_ffmpeg_with_progress() {
+  local input="$1" output="$2" dur_s="$3"; shift 3
+
+  local tty=0
+  [[ -t 1 ]] && tty=1
+
+  local dur_ms
+  dur_ms="$(python3 - <<'PY' "$dur_s"
+import sys
+d=float(sys.argv[1]) if sys.argv[1] else 0.0
+print(max(1, int(round(d*1000))))
+PY
+)"
+  local last_pct=-1
+
+  if (( tty == 1 )); then tput civis 2>/dev/null || true; fi
+
+  ffmpeg -hide_banner -y -nostats -v error \
+    -i "$input" \
+    "$@" \
+    -progress pipe:1 \
+    "$output" | \
+  while IFS='=' read -r key val; do
+    case "$key" in
+      out_time_ms)
+        # ffmpeg gives microseconds; convert to milliseconds
+        if [[ "$val" =~ ^[0-9]+$ ]]; then
+          local out_ms=$(( val / 1000 ))
+          local pct=$(( out_ms * 100 / dur_ms ))
+          (( pct > 100 )) && pct=100
+          if (( tty == 1 )) && (( pct != last_pct )); then
+            render_progress_line "$pct" 24
+            last_pct="$pct"
+          fi
+        fi
+        ;;
+      progress)
+        if [[ "$val" == "end" ]] && (( tty == 1 )); then clear_progress_line; fi
+        ;;
+    esac
+  done
+
+  local rc=${PIPESTATUS[0]}
+  if (( tty == 1 )); then tput cnorm 2>/dev/null || true; fi
+  return "$rc"
+}
+
+summary() {
+  local in="$1" out="$2" quality="$3" in_bytes="$4" out_bytes="$5" elapsed_s="$6"
+
+  local dur wh fps aud
+  dur="$(python3 - <<'PY' "$out"
+import subprocess, sys
+d = subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","default=nk=1:nw=1",sys.argv[1]]).decode().strip()
+sec=float(d) if d else 0.0
+h=int(sec//3600); m=int((sec%3600)//60); s=int(sec%60); ms=int((sec-int(sec))*1000)
+print(f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}" if sec else "")
+PY
+)"
+  wh="$(get_video_wh "$out")"
+  fps="$(get_video_fps "$out")"
+  aud="$(get_audio_summary "$out")"
+
+  local in_mib out_mib pct elapsed
+  in_mib="$(bytes_to_mib "$in_bytes")"
+  out_mib="$(bytes_to_mib "$out_bytes")"
+  pct="$(pct_change "$in_bytes" "$out_bytes")"
+  elapsed="$(format_elapsed "$elapsed_s")"
+
+  echo ""
+  echo "—— Share-ready summary ——"
+  echo "Mode:     Share (${quality} quality)"
+  echo "Output:   $(basename "$out")"
+  echo "Elapsed:  ${elapsed}"
+  [[ -n "${dur:-}" ]] && echo "Duration: ${dur}"
+  [[ -n "${wh:-}" ]] && echo "Video:    ${wh} @ ${fps:-?} fps"
+  echo "Audio:    ${aud}"
+  printf "Size:     %s MiB → %s MiB (%+d%%)\n" "$in_mib" "$out_mib" "$pct"
+  echo "———————————————"
+  echo ""
+}
+
+choose_video_encoder() {
+  # Prefer Apple VideoToolbox when available; fallback to libx264.
+  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_videotoolbox"; then
+    echo "h264_videotoolbox"
+  else
+    echo "libx264"
+  fi
+}
+
+share_cmd() {
+  need_tools
+  [[ $# -lt 1 ]] && die "vid share <input> [output.mp4|output|output_dir/] [-q|--quality low|default|high] [-v|--verbose]"
+
+  local in="$1"; shift
+  [[ -f "$in" ]] || die "Input file not found: $in"
+
+  local out_arg=""
+  local quality="default"
+  local verbose=0
+
+  # Optional positional output
+  if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+    out_arg="$1"; shift
+  fi
+
+  # Flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -q|--quality)
+        quality="${2:-}"; [[ -z "$quality" ]] && die "--quality requires value (low|default|high)"
+        shift 2
+        ;;
+      -v|--verbose)
+        verbose=1; shift
+        ;;
+      -h|--help)
+        usage; exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  case "$quality" in low|default|high) ;; *) die "--quality must be one of: low | default | high" ;; esac
+
+  # Output resolution:
+  # - If user passed an output FILE -> respect it (and auto-append .mp4 if missing)
+  # - If user passed an output DIR (existing or ends with '/') -> place default-named file inside it
+  # - Otherwise -> use default naming near input
+  local out
+  if [[ -n "$out_arg" ]]; then
+    if is_probably_dir_arg "$out_arg"; then
+      local base_out
+      base_out="$(build_default_out "$in" "share" "$quality")"
+      out="${out_arg%/}/$(basename "$base_out")"
+    else
+      out="$(ensure_mp4_extension_if_file "$out_arg")"
+    fi
+  else
+    out="$(build_default_out "$in" "share" "$quality")"
+  fi
+
+  # Never overwrite: auto-bump version properly
+  out="$(next_versioned_path "$out")"
+
+  # Ensure output directory exists
+  local out_dir
+  out_dir="$(dirname "$out")"
+  mkdir -p "$out_dir"
+
+  # Presets
+  local maxw="1920" fps="30" br="8000k" abr="128k"
+  case "$quality" in
+    low)     maxw="1280"; fps="30"; br="4000k";  abr="96k"  ;;
+    default) maxw="1920"; fps="30"; br="8000k";  abr="128k" ;;
+    high)    maxw="1920"; fps="30"; br="12000k"; abr="192k" ;;
+  esac
+
+  local enc
+  enc="$(choose_video_encoder)"
+
+  local in_bytes out_bytes dur start end elapsed
+  in_bytes="$(file_size_bytes "$in")"
+  dur="$(get_duration_seconds "$in")"
+
+  echo ""
+  start="$(date +%s)"
+
+  local ff_args=(
+    -map 0:v:0 -map 0:a?
+    -c:v "$enc" -b:v "$br"
+    -vf "scale='min(${maxw},iw)':-2"
+    -pix_fmt yuv420p
+    -fps_mode cfr -r "$fps"
+    -c:a aac -b:a "$abr"
+    -movflags +faststart
+  )
+
+  if [[ "$verbose" == "1" ]]; then
+    ffmpeg -hide_banner -y -i "$in" "${ff_args[@]}" "$out"
+  else
+    run_ffmpeg_with_progress "$in" "$out" "$dur" "${ff_args[@]}"
+  fi
+
+  end="$(date +%s)"
+  elapsed=$(( end - start ))
+
+  out_bytes="$(file_size_bytes "$out")"
+  ok "Share-ready: $(basename "$out")"
+  summary "$in" "$out" "$quality" "$in_bytes" "$out_bytes" "$elapsed"
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then usage; exit 1; fi
+
+  case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+    share) shift; share_cmd "$@" ;;
+    *) die "Unknown command: $1 (only 'share' is supported). Try: vid --help" ;;
+  esac
+}
+
+main "$@"
